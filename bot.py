@@ -90,6 +90,14 @@ def load_monitors() -> dict[str, dict[str, Any]]:
         return {}
 
     if isinstance(raw, dict):
+        for monitor in raw.values():
+            if not isinstance(monitor, dict):
+                continue
+            prefix = str(monitor.get("prefix", "")).strip()
+            if prefix and not prefix.endswith("."):
+                parts = prefix.split(".")
+                if len(parts) == 3 and all(x.isdigit() for x in parts):
+                    monitor["prefix"] = prefix + "."
         return raw
 
     # Older versions used a list. Do not let that crash the new bot.
@@ -147,9 +155,8 @@ PREFIX_RE = re.compile(r"^(?:\d{1,3}\.){2}\d{1,3}$")
 def normalize_prefix(value: str) -> Optional[str]:
     value = value.strip()
 
-    # Accept both:
-    # 24.7.110
-    # 24.7.110.
+    # Accept both 47.148.2 and 47.148.2., but ALWAYS
+    # normalize to the exact Cliproxy subnet form: 47.148.2.
     if value.endswith("."):
         value = value[:-1].strip()
 
@@ -161,7 +168,7 @@ def normalize_prefix(value: str) -> Optional[str]:
     if any(int(part) > 255 for part in parts):
         return None
 
-    return value
+    return value + "."
 
 
 def normalize_country(value: str) -> Optional[str]:
@@ -255,9 +262,8 @@ def cliproxy_search_sync(
         "asn": "",
         "key": CLIPROXY_KEY,
 
-        # IMPORTANT:
-        # Send the normalized 3-segment prefix WITHOUT
-        # adding a fourth/trailing dot.
+        # IMPORTANT: send the exact 3-octet subnet WITH
+        # the trailing dot, e.g. 47.148.2.
         "ipc": prefix,
 
         "lang": "en",
@@ -292,7 +298,30 @@ def cliproxy_search_sync(
 
         results = payload.get("data", [])
 
-        return results if isinstance(results, list) else []
+        if not isinstance(results, list):
+            return []
+
+        # Cliproxy may mask the second octet as "*", but the
+        # first and third octets must still match the requested
+        # subnet. For 47.148.2. the accepted form is 47.*.2.<host>.
+        requested = prefix.rstrip(".").split(".")
+        if len(requested) != 3:
+            return []
+
+        filtered = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            ip = str(item.get("ip", "")).strip()
+            parts = ip.split(".")
+            if len(parts) != 4:
+                continue
+            if (parts[0] == requested[0] and
+                (parts[1] == "*" or parts[1] == requested[1]) and
+                parts[2] == requested[2]):
+                filtered.append(item)
+
+        return filtered
 
     except (requests.RequestException, ValueError) as exc:
         print(
@@ -566,7 +595,7 @@ async def send_found_notification(
 
     embed.add_field(
         name="3 Seg",
-        value=f"`{monitor['prefix']}.xxx`",
+        value=f"`{monitor['prefix']}xxx`",
         inline=True,
     )
 
@@ -618,7 +647,7 @@ async def send_offline_notification(
 
     embed.add_field(
         name="3 Seg",
-        value=f"`{monitor['prefix']}.xxx`",
+        value=f"`{monitor['prefix']}xxx`",
         inline=True,
     )
 
@@ -670,7 +699,7 @@ async def send_back_online_notification(
 
     embed.add_field(
         name="3 Seg",
-        value=f"`{monitor['prefix']}.xxx`",
+        value=f"`{monitor['prefix']}xxx`",
         inline=True,
     )
 
@@ -1201,6 +1230,8 @@ async def list_watches(
     if not await allowed_user(interaction):
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     selected_filter = (
         filter.value
         if filter
@@ -1233,7 +1264,7 @@ async def list_watches(
     )
 
     if not items:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No watches match that filter.",
             ephemeral=True,
         )
@@ -1255,7 +1286,7 @@ async def list_watches(
         if status in counts:
             counts[status] += 1
 
-    chunk_size = 15
+    chunk_size = 8
     pages: list[discord.Embed] = []
 
     total_pages = (
@@ -1296,9 +1327,13 @@ async def list_watches(
             chunk,
             start=start + 1,
         ):
+            safe_name = str(monitor.get("name", ""))
+            if len(safe_name) > 50:
+                safe_name = safe_name[:47] + "..."
+
             lines.append(
                 f"**{index}. "
-                f"{monitor['name']}** — "
+                f"{safe_name}** — "
                 f"`{monitor['prefix']}` / "
                 f"`{monitor['country']}` — "
                 f"{display_status(monitor)}"
@@ -1317,7 +1352,7 @@ async def list_watches(
         pages,
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=pages[0],
         view=view,
         ephemeral=True,
@@ -1434,7 +1469,7 @@ async def watchinfo(
 
     embed.add_field(
         name="3 Seg",
-        value=f"`{monitor['prefix']}.xxx`",
+        value=f"`{monitor['prefix']}xxx`",
         inline=True,
     )
 
