@@ -32,7 +32,13 @@ MAX_CONCURRENT_REQUESTS = max(
     1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 )
 
-MONITORS_FILE = Path(os.getenv("MONITORS_FILE", "monitors.json"))
+_railway_volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+_default_monitors_path = (
+    str(Path(_railway_volume) / "monitors.json")
+    if _railway_volume
+    else "monitors.json"
+)
+MONITORS_FILE = Path(os.getenv("MONITORS_FILE", _default_monitors_path))
 
 ALLOWED_USER_IDS = {
     int(x.strip())
@@ -100,11 +106,44 @@ def load_monitors() -> dict[str, dict[str, Any]]:
                     monitor["prefix"] = prefix + "."
         return raw
 
-    # Older versions used a list. Do not let that crash the new bot.
-    print(
-        "WARNING: Old monitors.json format detected. "
-        "Starting with an empty monitor database."
-    )
+    # Older versions used a list. Keep valid records instead of crashing.
+    if isinstance(raw, list):
+        migrated: dict[str, dict[str, Any]] = {}
+        for index, record in enumerate(raw):
+            if not isinstance(record, dict):
+                continue
+            user_id = record.get("user_id")
+            if not str(user_id).isdigit():
+                continue
+            name = " ".join(str(record.get("name", "")).strip().split())
+            prefix = str(record.get("prefix", record.get("three_seg", ""))).strip().rstrip(".")
+            country = str(record.get("country", "")).strip().upper()
+            parts = prefix.split(".")
+            if not name or len(parts) != 3 or not all(part.isdigit() and int(part) <= 255 for part in parts) or len(country) != 2:
+                continue
+            key = f"{int(user_id)}:migrated-{index}"
+            def legacy_bool(value: Any) -> bool:
+                if isinstance(value, bool):
+                    return value
+                return str(value).strip().casefold() in {"1", "true", "yes", "y", "on"}
+
+            migrated[key] = {
+                "user_id": int(user_id), "name": name, "prefix": prefix + ".", "country": country,
+                "active": legacy_bool(record.get("active", True)),
+                "found": legacy_bool(record.get("found", False)),
+                "found_before": legacy_bool(record.get("found_before", record.get("found", False))),
+                "status": record.get("status", "waiting"),
+                "notify_offline": legacy_bool(record.get("notify_offline", True)),
+                "paused_until": record.get("paused_until"), "resume_status": record.get("resume_status"),
+                "last_checked": record.get("last_checked"), "last_match": record.get("last_match", []),
+                "last_match_count": int(record.get("last_match_count", 0) or 0),
+                "last_error": record.get("last_error"), "created_at": record.get("created_at", now_iso()),
+                "updated_at": record.get("updated_at", now_iso()),
+            }
+        print(f"Migrated {len(migrated)} watches from old list format.")
+        return migrated
+
+    print("WARNING: Unsupported monitors.json format; starting empty.")
     return {}
 
 
@@ -354,7 +393,6 @@ async def allowed_user(
     if interaction.user.id not in ALLOWED_USER_IDS:
         await interaction.response.send_message(
             "You are not authorized to use this bot.",
-            ephemeral=True,
         )
         return False
 
@@ -448,7 +486,6 @@ class PauseView(discord.ui.View):
         ):
             await interaction.response.send_message(
                 "I couldn't identify this watch.",
-                ephemeral=True,
             )
             return
 
@@ -464,7 +501,6 @@ class PauseView(discord.ui.View):
         if not name:
             await interaction.response.send_message(
                 "I couldn't identify this watch.",
-                ephemeral=True,
             )
             return
 
@@ -476,7 +512,6 @@ class PauseView(discord.ui.View):
         if not found:
             await interaction.response.send_message(
                 "I couldn't find that watch under your account.",
-                ephemeral=True,
             )
             return
 
@@ -735,13 +770,25 @@ async def check_one(
     monitor_snapshot: dict[str, Any],
 ) -> None:
 
-    results = await do_search(
-        monitor_snapshot
-    )
+    # Record the attempt even when the API itself fails. This prevents
+    # /watchinfo from being stuck forever on "Not checked yet".
+    attempt_time = now_iso()
+    async with monitors_lock:
+        live = monitors.get(key)
+        if live:
+            live["last_checked"] = attempt_time
+            live["last_error"] = None
 
-    # None means network/API/rate-limit error.
-    # Never interpret that as offline.
+    results = await do_search(monitor_snapshot)
+
+    # None means network/API/rate-limit error. Never interpret that as offline.
     if results is None:
+        async with monitors_lock:
+            live = monitors.get(key)
+            if live:
+                live["last_error"] = "Cliproxy API request failed, returned an API error, or was rate limited."
+                live["updated_at"] = now_iso()
+                await asyncio.to_thread(save_monitors_sync)
         return
 
     should_notify_found = False
@@ -930,16 +977,17 @@ async def run_monitor_cycle() -> None:
 
         # All watches can be scheduled here, but the semaphore
         # limits actual simultaneous HTTP requests.
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(
-                check_one(
-                    key,
-                    monitor,
-                )
+                check_one(key, monitor)
                 for key, monitor in snapshot
             ),
             return_exceptions=True,
         )
+
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Monitor task error: {type(result).__name__}: {result}")
 
         print("Monitor cycle complete.")
 
@@ -1009,7 +1057,6 @@ class ListView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
                 "This list belongs to another user.",
-                ephemeral=True,
             )
             return False
 
@@ -1105,7 +1152,6 @@ async def watch(
                 "Use something like "
                 "`180.183.130` or `180.183.130.`"
             ),
-            ephemeral=True,
         )
         return
 
@@ -1115,7 +1161,6 @@ async def watch(
                 "⚠️ Country must be a "
                 "2-letter code such as `US` or `TH`."
             ),
-            ephemeral=True,
         )
         return
 
@@ -1125,7 +1170,6 @@ async def watch(
                 "⚠️ Please enter a watch name "
                 "between 1 and 80 characters."
             ),
-            ephemeral=True,
         )
         return
 
@@ -1139,7 +1183,6 @@ async def watch(
                 f"Please use a different name, such as "
                 f"`{name}2` or `{name}3`."
             ),
-            ephemeral=True,
         )
         return
 
@@ -1180,13 +1223,16 @@ async def watch(
         (
             "✅ **Watch created.**\n\n"
             f"**Name:** {name}\n"
-            f"**3 Seg:** `{prefix}.xxx`\n"
+            f"**3 Seg:** `{prefix}xxx`\n"
             f"**Country:** `{country}`\n\n"
-            f"The bot will check it every "
-            f"{CHECK_INTERVAL // 60} minutes."
-        ),
-        ephemeral=True,
+            f"Recovery command: `/watch {prefix} {country} {name}`\n"
+            f"The bot checks it every {CHECK_INTERVAL // 60} minutes. "
+            "The first check is started now."
+        )
     )
+
+    # Do not make the user wait 15 minutes for the first check.
+    asyncio.create_task(check_one(key, dict(monitors[key])))
 
 
 @bot.tree.command(
@@ -1230,7 +1276,7 @@ async def list_watches(
     if not await allowed_user(interaction):
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
 
     selected_filter = (
         filter.value
@@ -1265,8 +1311,7 @@ async def list_watches(
 
     if not items:
         await interaction.followup.send(
-            "No watches match that filter.",
-            ephemeral=True,
+            "No watches match that filter."
         )
         return
 
@@ -1355,7 +1400,6 @@ async def list_watches(
     await interaction.followup.send(
         embed=pages[0],
         view=view,
-        ephemeral=True,
     )
 
 
@@ -1401,7 +1445,6 @@ async def searchwatch(
     if not matches:
         await interaction.response.send_message(
             "No watch names matched that search.",
-            ephemeral=True,
         )
         return
 
@@ -1422,9 +1465,7 @@ async def searchwatch(
         )
 
     await interaction.response.send_message(
-        "🔎 **Watch Search**\n\n"
-        + "\n".join(lines),
-        ephemeral=True,
+        "🔎 **Watch Search**\n\n" + "\n".join(lines)
     )
 
 
@@ -1451,7 +1492,6 @@ async def watchinfo(
     if not found:
         await interaction.response.send_message(
             "No watch with that name was found.",
-            ephemeral=True,
         )
         return
 
@@ -1536,6 +1576,14 @@ async def watchinfo(
                 inline=False,
             )
 
+    last_error = monitor.get("last_error")
+    if last_error:
+        embed.add_field(
+            name="Last API error",
+            value=str(last_error)[:1000],
+            inline=False,
+        )
+
     last_match = (
         monitor.get(
             "last_match"
@@ -1556,8 +1604,7 @@ async def watchinfo(
     )
 
     await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
+        embed=embed
     )
 
 
@@ -1584,7 +1631,6 @@ async def stop(
     if not found:
         await interaction.response.send_message(
             "No watch with that name was found.",
-            ephemeral=True,
         )
         return
 
@@ -1596,8 +1642,7 @@ async def stop(
     await save_monitors()
 
     await interaction.response.send_message(
-        f"🛑 Stopped **{monitor['name']}**.",
-        ephemeral=True,
+        f"🛑 Stopped **{monitor['name']}**."
     )
 
 
@@ -1641,7 +1686,6 @@ async def pause(
     if not found:
         await interaction.response.send_message(
             f"No watch named `{name}` was found.",
-            ephemeral=True,
         )
         return
 
@@ -1657,7 +1701,6 @@ async def pause(
     if current_status == "paused":
         await interaction.response.send_message(
             "That watch is already paused.",
-            ephemeral=True,
         )
         return
 
@@ -1690,8 +1733,7 @@ async def pause(
             f"for **{days} days**.\n\n"
             f"It will automatically resume on "
             f"<t:{int(resume_at.timestamp())}:F>."
-        ),
-        ephemeral=True,
+        )
     )
 
 
@@ -1721,7 +1763,6 @@ async def resume(
     if not found:
         await interaction.response.send_message(
             f"No watch named `{name}` was found.",
-            ephemeral=True,
         )
         return
 
@@ -1730,7 +1771,6 @@ async def resume(
     if monitor.get("status") != "paused":
         await interaction.response.send_message(
             "That watch is not currently paused.",
-            ephemeral=True,
         )
         return
 
@@ -1757,8 +1797,7 @@ async def resume(
         (
             f"▶️ **{monitor['name']}** has been resumed.\n"
             "It will be checked during the next monitoring cycle."
-        ),
-        ephemeral=True,
+        )
     )
 
 
@@ -1776,57 +1815,71 @@ async def export_watches(
     if not await allowed_user(interaction):
         return
 
-    data = {
-        "format": "cliproxy-monitor-backup",
-        "version": 3,
-        "exported_at": now_iso(),
-        "watches": [],
-    }
+    # Acknowledge immediately so a large 700+ watch export cannot
+    # hit Discord's interaction timeout.
+    await interaction.response.defer()
 
-    for _, monitor in user_monitors(
-        interaction.user.id
-    ):
-        data["watches"].append(
-            {
-                "name": monitor["name"],
-                "prefix": monitor["prefix"],
-                "country": monitor["country"],
-                "notify_offline": bool(
-                    monitor.get(
-                        "notify_offline",
-                        True,
-                    )
-                ),
-                "active": bool(
-                    monitor.get(
-                        "active",
-                        True,
-                    )
-                ),
-            }
+    try:
+        watches = []
+        recovery_lines = [
+            "# Cliproxy watch recovery commands",
+            "# Re-run each /watch line to recreate the watches.",
+            "",
+        ]
+
+        for _, monitor in user_monitors(interaction.user.id):
+            name = str(monitor.get("name", ""))
+            prefix = str(monitor.get("prefix", "")).rstrip(".")
+            country = str(monitor.get("country", ""))
+            watches.append({
+                "name": name,
+                "prefix": prefix + ".",
+                "country": country,
+                "notify_offline": bool(monitor.get("notify_offline", True)),
+                "active": bool(monitor.get("active", True)),
+            })
+            recovery_lines.append(
+                f"/watch {prefix}. {country} {name}"
+            )
+
+        data = {
+            "format": "cliproxy-monitor-backup",
+            "version": 4,
+            "exported_at": now_iso(),
+            "watches": watches,
+        }
+
+        json_raw = json.dumps(
+            data, indent=2, ensure_ascii=False
+        ).encode("utf-8")
+        txt_raw = "\n".join(recovery_lines).encode("utf-8")
+
+        json_file = discord.File(
+            io.BytesIO(json_raw),
+            filename="cliproxy_watches_backup.json",
+        )
+        txt_file = discord.File(
+            io.BytesIO(txt_raw),
+            filename="cliproxy_watch_recovery.txt",
         )
 
-    raw = json.dumps(
-        data,
-        indent=2,
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-    file = discord.File(
-        io.BytesIO(raw),
-        filename="cliproxy_watches_backup.json",
-    )
-
-    await interaction.response.send_message(
-        (
-            f"✅ Exported "
-            f"**{len(data['watches'])}** watches. "
-            "Keep this file somewhere safe."
-        ),
-        file=file,
-        ephemeral=True,
-    )
-
+        await interaction.followup.send(
+            (
+                f"✅ **Export complete — {len(watches)} watches.**\n\n"
+                "Two backups are attached: JSON for `/import`, and TXT with "
+                "one `/watch` command per line for manual recovery.\n\n"
+                "This message is public so it remains visible in channel history."
+            ),
+            files=[json_file, txt_file],
+        )
+    except Exception as exc:
+        print(f"Export error: {type(exc).__name__}: {exc}")
+        try:
+            await interaction.followup.send(
+                "❌ Export failed. Check the Railway logs for the exact error."
+            )
+        except Exception:
+            pass
 
 @bot.tree.command(
     name="import",
@@ -1843,6 +1896,8 @@ async def import_watches(
     if not await allowed_user(interaction):
         return
 
+    await interaction.response.defer()
+
     filename = file.filename.casefold()
 
     if not (
@@ -1850,22 +1905,20 @@ async def import_watches(
         or filename.endswith(".csv")
         or filename.endswith(".txt")
     ):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             (
                 "⚠️ Please upload a `.json`, "
                 "`.csv`, or `.txt` backup file."
             ),
-            ephemeral=True,
         )
         return
 
     if file.size and file.size > 2_000_000:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             (
                 "⚠️ That backup is too large. "
                 "Please keep it under 2 MB."
             ),
-            ephemeral=True,
         )
         return
 
@@ -1876,9 +1929,8 @@ async def import_watches(
         )
 
     except Exception as exc:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ Could not read the file: {exc}",
-            ephemeral=True,
         )
         return
 
@@ -1909,9 +1961,8 @@ async def import_watches(
             ]
 
     except Exception as exc:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ Could not parse the backup: {exc}",
-            ephemeral=True,
         )
         return
 
@@ -2063,9 +2114,43 @@ async def import_watches(
             + reason_text
         )
 
-    await interaction.response.send_message(
-        response,
-        ephemeral=True,
+    await interaction.followup.send(response)
+
+
+@bot.tree.command(
+    name="health",
+    description="Show bot storage, API, and monitoring health.",
+)
+async def health(interaction: discord.Interaction) -> None:
+    if not await allowed_user(interaction):
+        return
+
+    await interaction.response.defer()
+
+    volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "not attached")
+    file_exists = MONITORS_FILE.exists()
+    size = MONITORS_FILE.stat().st_size if file_exists else 0
+
+    api_line = "Not tested"
+    sample = next(iter(user_monitors(interaction.user.id)), None)
+    if sample:
+        _, sample_monitor = sample
+        results = await do_search(sample_monitor)
+        api_line = (
+            f"OK — {len(results)} matching result(s)"
+            if results is not None
+            else "FAILED — check Railway logs / .env API credentials"
+        )
+
+    await interaction.followup.send(
+        "🩺 **Bot Health**\n\n"
+        f"**Watches loaded:** `{len(monitors)}`\n"
+        f"**Storage file:** `{MONITORS_FILE}`\n"
+        f"**Storage exists:** `{file_exists}` ({size} bytes)\n"
+        f"**Railway volume:** `{volume}`\n"
+        f"**Cliproxy API:** {api_line}\n"
+        f"**Check interval:** `{CHECK_INTERVAL // 60}` minutes\n"
+        f"**Max concurrent requests:** `{MAX_CONCURRENT_REQUESTS}`"
     )
 
 
