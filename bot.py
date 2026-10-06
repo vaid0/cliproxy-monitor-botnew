@@ -55,6 +55,13 @@ CLIPROXY_HEADERS = {
     "User-Agent": "Mozilla/5.0",
 }
 
+# Minimum delay between Cliproxy request starts. This helps avoid a large
+# burst of simultaneous requests when hundreds of watches are checked.
+# 0.5s still allows 700 watches to be attempted in about 6 minutes.
+REQUEST_START_DELAY = max(0.0, float(os.getenv("REQUEST_START_DELAY", "0.5")))
+request_pace_lock = asyncio.Lock()
+last_request_start = 0.0
+
 # -----------------------------
 # Persistent monitor storage
 # -----------------------------
@@ -137,7 +144,15 @@ def load_monitors() -> dict[str, dict[str, Any]]:
                 "paused_until": record.get("paused_until"), "resume_status": record.get("resume_status"),
                 "last_checked": record.get("last_checked"), "last_match": record.get("last_match", []),
                 "last_match_count": int(record.get("last_match_count", 0) or 0),
-                "last_error": record.get("last_error"), "created_at": record.get("created_at", now_iso()),
+                "last_error": record.get("last_error"),
+                "last_error_type": record.get("last_error_type"),
+                "last_http_status": record.get("last_http_status"),
+                "last_api_code": record.get("last_api_code"),
+                "last_api_message": record.get("last_api_message"),
+                "last_retry_after": record.get("last_retry_after"),
+                "last_attempt": record.get("last_attempt", record.get("last_checked")),
+                "last_successful_check": record.get("last_successful_check"),
+                "created_at": record.get("created_at", now_iso()),
                 "updated_at": record.get("updated_at", now_iso()),
             }
         print(f"Migrated {len(migrated)} watches from old list format.")
@@ -292,21 +307,28 @@ def display_status(monitor: dict[str, Any]) -> str:
 def cliproxy_search_sync(
     prefix: str,
     country: str,
-) -> Optional[list[dict[str, Any]]]:
-
+) -> dict[str, Any]:
+    """Call Cliproxy and return results plus detailed diagnostics."""
     data = {
         "country": country,
         "state": "",
         "city": "",
         "asn": "",
         "key": CLIPROXY_KEY,
-
-        # IMPORTANT: send the exact 3-octet subnet WITH
-        # the trailing dot, e.g. 47.148.2.
         "ipc": prefix,
-
         "lang": "en",
         "token": CLIPROXY_TOKEN,
+    }
+
+    diagnostic: dict[str, Any] = {
+        "ok": False,
+        "results": [],
+        "http_status": None,
+        "api_code": None,
+        "api_message": None,
+        "error_type": None,
+        "error": None,
+        "retry_after": None,
     }
 
     try:
@@ -317,57 +339,129 @@ def cliproxy_search_sync(
             timeout=30,
         )
 
+        diagnostic["http_status"] = response.status_code
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            diagnostic["retry_after"] = retry_after
+
         if response.status_code == 429:
+            diagnostic["error_type"] = "rate_limited"
+            diagnostic["error"] = "HTTP 429 Too Many Requests"
             print(
-                f"Cliproxy rate limited {prefix}/{country}"
+                f"Cliproxy 429 rate limit for {prefix}/{country} "
+                f"(Retry-After={retry_after or 'not provided'})"
             )
-            return None
+            return diagnostic
 
-        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            diagnostic["error_type"] = "invalid_json"
+            diagnostic["error"] = f"Response was not valid JSON: {exc}"
+            print(
+                f"Cliproxy invalid JSON for {prefix}/{country}: "
+                f"HTTP {response.status_code}; {exc}"
+            )
+            return diagnostic
 
-        payload = response.json()
+        if not isinstance(payload, dict):
+            diagnostic["error_type"] = "invalid_response"
+            diagnostic["error"] = "Cliproxy returned a non-object JSON response."
+            print(
+                f"Cliproxy invalid response for {prefix}/{country}: "
+                f"HTTP {response.status_code}"
+            )
+            return diagnostic
+
+        diagnostic["api_code"] = payload.get("code")
+        diagnostic["api_message"] = payload.get("msg")
+
+        if response.status_code < 200 or response.status_code >= 300:
+            diagnostic["error_type"] = "http_error"
+            diagnostic["error"] = (
+                f"HTTP {response.status_code}"
+                + (f" — {payload.get('msg')}" if payload.get("msg") else "")
+            )
+            print(
+                f"Cliproxy HTTP error for {prefix}/{country}: "
+                f"HTTP {response.status_code}; code={payload.get('code')}; "
+                f"msg={payload.get('msg')}"
+            )
+            return diagnostic
 
         if payload.get("code") != 0:
-            print(
-                f"Cliproxy API error for "
-                f"{prefix}/{country}: "
-                f"{payload.get('msg')}"
+            diagnostic["error_type"] = "api_error"
+            diagnostic["error"] = (
+                f"Cliproxy API code {payload.get('code')}"
+                + (f" — {payload.get('msg')}" if payload.get("msg") else "")
             )
-            return None
+            print(
+                f"Cliproxy API error for {prefix}/{country}: "
+                f"HTTP {response.status_code}; code={payload.get('code')}; "
+                f"msg={payload.get('msg')}"
+            )
+            return diagnostic
 
         results = payload.get("data", [])
 
         if not isinstance(results, list):
-            return []
+            diagnostic["error_type"] = "invalid_data"
+            diagnostic["error"] = "Cliproxy returned a non-list data field."
+            print(f"Cliproxy invalid data for {prefix}/{country}: data is not a list")
+            return diagnostic
 
-        # Cliproxy may mask the second octet as "*", but the
-        # first and third octets must still match the requested
-        # subnet. For 47.148.2. the accepted form is 47.*.2.<host>.
         requested = prefix.rstrip(".").split(".")
         if len(requested) != 3:
-            return []
+            diagnostic["error_type"] = "invalid_prefix"
+            diagnostic["error"] = f"Invalid normalized prefix: {prefix}"
+            return diagnostic
 
         filtered = []
         for item in results:
             if not isinstance(item, dict):
                 continue
+
             ip = str(item.get("ip", "")).strip()
             parts = ip.split(".")
             if len(parts) != 4:
                 continue
-            if (parts[0] == requested[0] and
-                (parts[1] == "*" or parts[1] == requested[1]) and
-                parts[2] == requested[2]):
+
+            # Cliproxy can mask the second octet as '*'. The first and
+            # third octets must still match the requested 3-segment prefix.
+            if (
+                parts[0] == requested[0]
+                and (parts[1] == "*" or parts[1] == requested[1])
+                and parts[2] == requested[2]
+            ):
                 filtered.append(item)
 
-        return filtered
+        diagnostic["ok"] = True
+        diagnostic["results"] = filtered
+        return diagnostic
 
-    except (requests.RequestException, ValueError) as exc:
-        print(
-            f"Cliproxy request failed for "
-            f"{prefix}/{country}: {exc}"
-        )
-        return None
+    except requests.Timeout as exc:
+        diagnostic["error_type"] = "timeout"
+        diagnostic["error"] = f"Request timed out after 30 seconds: {exc}"
+        print(f"Cliproxy timeout for {prefix}/{country}: {exc}")
+        return diagnostic
+
+    except requests.ConnectionError as exc:
+        diagnostic["error_type"] = "connection_error"
+        diagnostic["error"] = f"Connection error: {exc}"
+        print(f"Cliproxy connection error for {prefix}/{country}: {exc}")
+        return diagnostic
+
+    except requests.RequestException as exc:
+        diagnostic["error_type"] = "request_error"
+        diagnostic["error"] = f"Request error: {exc}"
+        print(f"Cliproxy request error for {prefix}/{country}: {exc}")
+        return diagnostic
+
+    except Exception as exc:
+        diagnostic["error_type"] = "unexpected_error"
+        diagnostic["error"] = f"Unexpected error: {type(exc).__name__}: {exc}"
+        print(f"Unexpected Cliproxy error for {prefix}/{country}: {type(exc).__name__}: {exc}")
+        return diagnostic
 
 
 # -----------------------------
@@ -400,10 +494,21 @@ async def allowed_user(
 
 
 async def do_search(
-    monitor: dict[str, Any],
-) -> Optional[list[dict[str, Any]]]:
+    monitor: dict[str, Any]
+) -> dict[str, Any]:
+    """Run a Cliproxy request with concurrency and request-start pacing."""
+    global last_request_start
 
     async with monitor_semaphore:
+        if REQUEST_START_DELAY > 0:
+            async with request_pace_lock:
+                loop = asyncio.get_running_loop()
+                current = loop.time()
+                wait_for = (last_request_start + REQUEST_START_DELAY) - current
+                if wait_for > 0:
+                    await asyncio.sleep(wait_for)
+                last_request_start = loop.time()
+
         return await asyncio.to_thread(
             cliproxy_search_sync,
             monitor["prefix"],
@@ -768,28 +873,37 @@ async def send_back_online_notification(
 async def check_one(
     key: str,
     monitor_snapshot: dict[str, Any],
-) -> None:
-
-    # Record the attempt even when the API itself fails. This prevents
-    # /watchinfo from being stuck forever on "Not checked yet".
+) -> dict[str, Any]:
+    """Check one watch and never treat API failures as an offline result."""
     attempt_time = now_iso()
+
     async with monitors_lock:
         live = monitors.get(key)
         if live:
             live["last_checked"] = attempt_time
+            live["last_attempt"] = attempt_time
             live["last_error"] = None
+            live["last_error_type"] = None
+            live["last_http_status"] = None
+            live["last_api_code"] = None
+            live["last_api_message"] = None
 
-    results = await do_search(monitor_snapshot)
+    diagnostic = await do_search(monitor_snapshot)
+    results = diagnostic.get("results", []) if diagnostic.get("ok") else None
 
-    # None means network/API/rate-limit error. Never interpret that as offline.
-    if results is None:
+    if not diagnostic.get("ok"):
         async with monitors_lock:
             live = monitors.get(key)
             if live:
-                live["last_error"] = "Cliproxy API request failed, returned an API error, or was rate limited."
+                live["last_error"] = diagnostic.get("error") or "Unknown Cliproxy error"
+                live["last_error_type"] = diagnostic.get("error_type")
+                live["last_http_status"] = diagnostic.get("http_status")
+                live["last_api_code"] = diagnostic.get("api_code")
+                live["last_api_message"] = diagnostic.get("api_message")
+                live["last_retry_after"] = diagnostic.get("retry_after")
                 live["updated_at"] = now_iso()
                 await asyncio.to_thread(save_monitors_sync)
-        return
+        return diagnostic
 
     should_notify_found = False
     should_notify_offline = False
@@ -799,94 +913,55 @@ async def check_one(
         monitor = monitors.get(key)
 
         if not monitor:
-            return
-
-        old_status = monitor.get(
-            "status",
-            "waiting",
-        )
+            return diagnostic
 
         monitor["last_checked"] = now_iso()
+        monitor["last_successful_check"] = monitor["last_checked"]
         monitor["last_error"] = None
+        monitor["last_error_type"] = None
+        monitor["last_http_status"] = diagnostic.get("http_status")
+        monitor["last_api_code"] = diagnostic.get("api_code")
+        monitor["last_api_message"] = diagnostic.get("api_message")
+        monitor["last_retry_after"] = None
+
+        old_status = monitor.get("status", "waiting")
 
         if results:
             monitor["status"] = "online"
             monitor["found"] = True
             monitor["found_before"] = True
+            monitor["last_match"] = result_ips(results)[:25]
+            monitor["last_match_count"] = len(results)
 
-            monitor["last_match"] = (
-                result_ips(results)[:25]
-            )
-
-            monitor["last_match_count"] = len(
-                results
-            )
-
-            # WAITING -> ONLINE:
-            # send the initial "found" notification.
             if old_status == "waiting":
                 should_notify_found = True
-
-            # OFFLINE -> ONLINE:
-            # send a back-online notification.
-            elif old_status == "offline":
-                if monitor.get(
-                    "notify_offline",
-                    True,
-                ):
-                    should_notify_back_online = True
+            elif old_status == "offline" and monitor.get("notify_offline", True):
+                should_notify_back_online = True
 
         else:
             monitor["last_match"] = []
             monitor["last_match_count"] = 0
 
-            if (
-                old_status == "online"
-                and monitor.get("found_before", False)
-            ):
-                # ONLINE -> OFFLINE
+            if old_status == "online" and monitor.get("found_before", False):
                 monitor["status"] = "offline"
-
-                if monitor.get(
-                    "notify_offline",
-                    True,
-                ):
+                if monitor.get("notify_offline", True):
                     should_notify_offline = True
-
-            elif monitor.get(
-                "found_before",
-                False,
-            ):
+            elif monitor.get("found_before", False):
                 monitor["status"] = "offline"
-
             else:
-                # It has never been found.
                 monitor["status"] = "waiting"
 
         monitor["updated_at"] = now_iso()
-
-        # Save before sending a DM so the state is not lost
-        # if Discord notification delivery fails.
-        await asyncio.to_thread(
-            save_monitors_sync
-        )
+        await asyncio.to_thread(save_monitors_sync)
 
     if should_notify_found:
-        await send_found_notification(
-            monitor,
-            results,
-        )
-
+        await send_found_notification(monitor, results)
     elif should_notify_offline:
-        await send_offline_notification(
-            monitor,
-        )
-
+        await send_offline_notification(monitor)
     elif should_notify_back_online:
-        await send_back_online_notification(
-            monitor,
-            results,
-        )
+        await send_back_online_notification(monitor, results)
+
+    return diagnostic
 
 
 async def run_monitor_cycle() -> None:
@@ -1210,9 +1285,16 @@ async def watch(
         "resume_status": None,
 
         "last_checked": None,
+        "last_attempt": None,
+        "last_successful_check": None,
         "last_match": [],
         "last_match_count": 0,
         "last_error": None,
+        "last_error_type": None,
+        "last_http_status": None,
+        "last_api_code": None,
+        "last_api_message": None,
+        "last_retry_after": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -1550,13 +1632,36 @@ async def watchinfo(
     )
 
     embed.add_field(
-        name="Last checked",
+        name="Last attempt",
         value=(
-            monitor.get(
-                "last_checked"
-            )
+            monitor.get("last_attempt")
+            or monitor.get("last_checked")
             or "Not checked yet"
         ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Last successful check",
+        value=monitor.get("last_successful_check") or "None yet",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="HTTP status",
+        value=str(monitor.get("last_http_status") or "None"),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="API code",
+        value=str(monitor.get("last_api_code") if monitor.get("last_api_code") is not None else "None"),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="API message",
+        value=str(monitor.get("last_api_message") or "None")[:1000],
         inline=False,
     )
 
@@ -1583,6 +1688,16 @@ async def watchinfo(
             value=str(last_error)[:1000],
             inline=False,
         )
+        embed.add_field(
+            name="Error type",
+            value=str(monitor.get("last_error_type") or "Unknown"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Retry-After",
+            value=str(monitor.get("last_retry_after") or "Not provided"),
+            inline=True,
+        )
 
     last_match = (
         monitor.get(
@@ -1605,6 +1720,83 @@ async def watchinfo(
 
     await interaction.response.send_message(
         embed=embed
+    )
+
+
+@bot.tree.command(
+    name="check",
+    description="Immediately check one of your Cliproxy watches.",
+)
+@app_commands.describe(
+    name="Exact watch name to check now",
+)
+async def check_watch(
+    interaction: discord.Interaction,
+    name: str,
+) -> None:
+    if not await allowed_user(interaction):
+        return
+
+    found = find_monitor_by_name(interaction.user.id, name)
+
+    if not found:
+        await interaction.response.send_message(
+            f"No watch named `{name}` was found."
+        )
+        return
+
+    key, monitor = found
+
+    await interaction.response.defer()
+    diagnostic = await check_one(key, dict(monitor))
+    live = monitors.get(key, monitor)
+
+    if diagnostic.get("ok"):
+        results = diagnostic.get("results", [])
+        ips = result_ips(results)
+
+        if results:
+            shown = "\n".join(
+                f"• `{ip}`" for ip in ips[:15]
+            ) or "• Match found"
+            if len(ips) > 15:
+                shown += f"\n• …and {len(ips) - 15} more"
+            status_line = "🟢 **ONLINE — MATCH FOUND**"
+            result_line = shown
+        else:
+            status_line = (
+                "🔴 **OFFLINE**"
+                if live.get("found_before", False)
+                else "⚪ **WAITING — NO MATCH**"
+            )
+            result_line = "No matching Cliproxy results were returned."
+
+        await interaction.followup.send(
+            "🔎 **Manual Cliproxy Check**\n\n"
+            f"**Name:** {live.get('name', name)}\n"
+            f"**3 Seg:** `{live.get('prefix')}`\n"
+            f"**Country:** `{live.get('country')}`\n"
+            f"**Result:** {status_line}\n"
+            f"**HTTP status:** `{diagnostic.get('http_status')}`\n"
+            f"**API code:** `{diagnostic.get('api_code')}`\n"
+            f"**API message:** `{diagnostic.get('api_message') or 'None'}`\n\n"
+            f"**Matches:** `{len(results)}`\n"
+            f"**IP result(s):**\n{result_line}"
+        )
+        return
+
+    await interaction.followup.send(
+        "❌ **Manual Cliproxy Check Failed**\n\n"
+        f"**Name:** {live.get('name', name)}\n"
+        f"**3 Seg:** `{live.get('prefix')}`\n"
+        f"**Country:** `{live.get('country')}`\n\n"
+        f"**Error type:** `{diagnostic.get('error_type') or 'unknown'}`\n"
+        f"**HTTP status:** `{diagnostic.get('http_status')}`\n"
+        f"**API code:** `{diagnostic.get('api_code')}`\n"
+        f"**API message:** `{diagnostic.get('api_message') or 'None'}`\n"
+        f"**Retry-After:** `{diagnostic.get('retry_after') or 'Not provided'}`\n\n"
+        f"**Exact error:** `{str(diagnostic.get('error') or 'Unknown error')[:900]}`\n\n"
+        "The watch was **not** marked offline because this was an API/request failure."
     )
 
 
@@ -2086,9 +2278,16 @@ async def import_watches(
             "paused_until": None,
             "resume_status": None,
             "last_checked": None,
+            "last_attempt": None,
+            "last_successful_check": None,
             "last_match": [],
             "last_match_count": 0,
             "last_error": None,
+            "last_error_type": None,
+            "last_http_status": None,
+            "last_api_code": None,
+            "last_api_message": None,
+            "last_retry_after": None,
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -2135,12 +2334,21 @@ async def health(interaction: discord.Interaction) -> None:
     sample = next(iter(user_monitors(interaction.user.id)), None)
     if sample:
         _, sample_monitor = sample
-        results = await do_search(sample_monitor)
-        api_line = (
-            f"OK — {len(results)} matching result(s)"
-            if results is not None
-            else "FAILED — check Railway logs / .env API credentials"
-        )
+        diagnostic = await do_search(sample_monitor)
+        if diagnostic.get("ok"):
+            api_line = (
+                f"OK — HTTP {diagnostic.get('http_status')}; "
+                f"API code {diagnostic.get('api_code')}; "
+                f"{len(diagnostic.get('results', []))} matching result(s)"
+            )
+        else:
+            api_line = (
+                f"FAILED — type={diagnostic.get('error_type')}; "
+                f"HTTP={diagnostic.get('http_status')}; "
+                f"code={diagnostic.get('api_code')}; "
+                f"message={diagnostic.get('api_message') or 'None'}; "
+                f"error={diagnostic.get('error') or 'Unknown'}"
+            )
 
     await interaction.followup.send(
         "🩺 **Bot Health**\n\n"
@@ -2150,7 +2358,8 @@ async def health(interaction: discord.Interaction) -> None:
         f"**Railway volume:** `{volume}`\n"
         f"**Cliproxy API:** {api_line}\n"
         f"**Check interval:** `{CHECK_INTERVAL // 60}` minutes\n"
-        f"**Max concurrent requests:** `{MAX_CONCURRENT_REQUESTS}`"
+        f"**Max concurrent requests:** `{MAX_CONCURRENT_REQUESTS}`\n"
+        f"**Request start delay:** `{REQUEST_START_DELAY}s`"
     )
 
 
